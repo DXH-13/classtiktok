@@ -1,6 +1,7 @@
 const { WebcastPushConnection } = require('tiktok-live-connector');
 const { gameState } = require('../quiz/gameState');
-const { checkAnswer, calculateScore } = require('../quiz/scoreEngine');
+const { calculateScore, classifyAnswer } = require('../quiz/scoreEngine');
+const { checkWithGemini, isAIEnabled, AI_MIN_CONFIDENCE } = require('../quiz/aiChecker');
 const { prisma } = require('../db/prisma');
 
 class TikTokManager {
@@ -83,6 +84,16 @@ class TikTokManager {
 
   /**
    * Xử lý comment từ TikTok
+   *
+   * Luồng AI-per-comment (Gemini):
+   *  1. Luật chấm NGAY (classifyAnswer) -> ghi điểm + phát leaderboard luôn,
+   *     không đợi AI. Điểm theo thời gian tính từ lúc comment tới.
+   *  2. Gemini chạy NỀN cho mỗi comment mới (không await, không chặn comment
+   *     tiếp theo). Comment giống nhau trong cùng 1 câu hỏi được cache nên
+   *     chỉ gọi 1 lần (xem aiChecker.js).
+   *  3. Nếu Gemini kết luận khác luật và đủ tự tin -> sửa điểm + leaderboard
+   *     và phát sự kiện 'game:answerUpdated'. Gemini lỗi/timeout/không có key
+   *     -> giữ nguyên kết quả luật.
    */
   async _handleComment(data) {
     const sessionId = this.activeSessionId;
@@ -91,7 +102,6 @@ class TikTokManager {
     const session = gameState.getSession(sessionId);
     if (!session || session.status !== 'active') return;
 
-    const { question } = session.currentQuestion ? { question: session.currentQuestion } : {};
     if (!session.currentQuestion) return;
 
     const q = session.currentQuestion;
@@ -100,8 +110,9 @@ class TikTokManager {
     const avatarUrl = data.profilePictureUrl || '';
     const commentText = data.comment || '';
 
-    // Kiểm tra đáp án
-    const isCorrect = checkAnswer(q.type, commentText, q.correctAnswer);
+    // 1. Luật chấm ngay
+    const classification = classifyAnswer(q.type, commentText, q.correctAnswer);
+    const isCorrect = classification.verdict === 'correct';
     const responseTime = (Date.now() - session.questionStartTime) / 1000;
     const score = calculateScore(isCorrect, responseTime, q.timeLimit, q.baseScore);
 
@@ -131,6 +142,85 @@ class TikTokManager {
 
     // Lưu vào DB (background, không await để không block)
     this._saveAnswerToDB(sessionId, q.id, tiktokUserId, nickname, avatarUrl, commentText, isCorrect, score, result.responseTime).catch(() => {});
+
+    // 2. Gemini chạy nền cho comment này (không await)
+    if (isAIEnabled()) {
+      this._aiCheckAndRevise(sessionId, q, tiktokUserId, nickname, commentText, isCorrect, result.responseTime).catch(() => {});
+    }
+  }
+
+  /**
+   * Gemini chấm lại 1 comment; nếu khác luật và đủ tự tin thì sửa điểm.
+   * Lưu ý: nếu Gemini trả về sau khi câu hỏi đã chốt (questionEnd đã phát),
+   * điểm/leaderboard vẫn được sửa (dashboard + DB), nhưng bảng kết quả của
+   * câu đó đã hiện thì không phát lại — lần sau nên để AI timeout < timeLimit.
+   */
+  async _aiCheckAndRevise(sessionId, q, tiktokUserId, nickname, commentText, ruleIsCorrect, responseTime) {
+    const session = gameState.getSession(sessionId);
+    // Chỉ sửa khi vẫn đang ở cùng câu hỏi đó (kể cả khi câu vừa hết giờ).
+    if (!session || !session.currentQuestion || session.currentQuestion.id !== q.id) return;
+
+    const ai = await checkWithGemini({
+      questionId: q.id,
+      questionType: q.type,
+      questionText: q.questionText,
+      options: { A: q.optionA, B: q.optionB, C: q.optionC, D: q.optionD },
+      userAnswer: commentText,
+      correctAnswer: q.correctAnswer,
+    });
+    if (!ai) return; // lỗi/timeout -> giữ kết quả luật
+    if (ai.confidence < AI_MIN_CONFIDENCE) return;
+    if (ai.isCorrect === ruleIsCorrect) return; // Gemini đồng ý với luật
+
+    const newScore = calculateScore(ai.isCorrect, responseTime, q.timeLimit, q.baseScore);
+    const revised = gameState.reviseAnswer(sessionId, tiktokUserId, ai.isCorrect, newScore);
+    if (!revised) return;
+
+    console.log(`🤖 AI sửa đáp án @${nickname}: ${ruleIsCorrect} -> ${ai.isCorrect} (${ai.reason || 'Gemini'})`);
+
+    this.io?.emit('game:answerUpdated', {
+      sessionId,
+      tiktokUserId,
+      nickname,
+      commentText,
+      isCorrect: ai.isCorrect,
+      score: newScore,
+      responseTime,
+      aiReason: ai.reason || '',
+      aiConfidence: ai.confidence,
+    });
+
+    const leaderboard = gameState.getLeaderboard(sessionId);
+    this.io?.emit('game:leaderboard', { sessionId, leaderboard });
+
+    this._updateAnswerInDB(sessionId, q.id, tiktokUserId, ai.isCorrect, newScore).catch(() => {});
+  }
+
+  // Cập nhật lại DB sau khi AI sửa (cộng/trừ phần chênh lệch điểm)
+  async _updateAnswerInDB(sessionId, questionId, tiktokUserId, isCorrect, newScore) {
+    try {
+      const player = await prisma.player.findUnique({
+        where: { sessionId_tiktokUserId: { sessionId, tiktokUserId } },
+      });
+      if (!player) return;
+      const answer = await prisma.answer.findUnique({
+        where: { sessionId_questionId_playerId: { sessionId, questionId, playerId: player.id } },
+      });
+      if (!answer) return;
+      const delta = newScore - answer.score;
+      await prisma.answer.update({
+        where: { id: answer.id },
+        data: { isCorrect, score: newScore },
+      });
+      await prisma.player.update({
+        where: { id: player.id },
+        data: {
+          totalScore: { increment: delta },
+          correctCount: !answer.isCorrect && isCorrect ? { increment: 1 } : answer.isCorrect && !isCorrect ? { decrement: 1 } : undefined,
+          wrongCount: answer.isCorrect && !isCorrect ? { increment: 1 } : !answer.isCorrect && isCorrect ? { decrement: 1 } : undefined,
+        },
+      });
+    } catch {}
   }
 
   async _saveAnswerToDB(sessionId, questionId, tiktokUserId, nickname, avatarUrl, commentText, isCorrect, score, responseTime) {

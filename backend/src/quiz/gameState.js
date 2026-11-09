@@ -86,6 +86,35 @@ class GameState {
   }
 
   /**
+   * Sửa lại 1 đáp án đã ghi nhận — dùng khi Gemini kết luận khác luật.
+   * Chỉ cộng/trừ phần chênh lệch điểm, KHÔNG tính lại responseTime
+   * (thời gian trả lời vẫn là lúc comment tới).
+   * @returns {object|null} entry đã sửa, hoặc null nếu không có gì thay đổi
+   */
+  reviseAnswer(sessionId, tiktokUserId, isCorrect, score) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return null;
+    const entry = session.questionAnswers.get(tiktokUserId);
+    if (!entry) return null;
+    if (entry.isCorrect === isCorrect && entry.score === score) return null;
+
+    const player = session.players.get(tiktokUserId);
+    if (player) {
+      player.totalScore += score - entry.score;
+      if (entry.isCorrect && !isCorrect) {
+        player.correctCount -= 1;
+        player.wrongCount += 1;
+      } else if (!entry.isCorrect && isCorrect) {
+        player.wrongCount -= 1;
+        player.correctCount += 1;
+      }
+    }
+    entry.isCorrect = isCorrect;
+    entry.score = score;
+    return { tiktokUserId, ...entry };
+  }
+
+  /**
    * Lấy leaderboard (top 10)
    */
   getLeaderboard(sessionId, limit = 10) {

@@ -1,0 +1,94 @@
+// This is your Prisma schema file
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Bộ câu hỏi (Quiz Set)
+model QuizSet {
+  id          Int        @id @default(autoincrement())
+  title       String
+  description String?
+  type        String     @default("multiple_choice") // multiple_choice | text_answer | vua_tieng_viet
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  questions   Question[]
+  sessions    GameSession[]
+}
+
+// Câu hỏi
+model Question {
+  id            Int      @id @default(autoincrement())
+  quizSetId     Int
+  quizSet       QuizSet  @relation(fields: [quizSetId], references: [id], onDelete: Cascade)
+  order         Int      @default(0)
+  type          String   @default("multiple_choice") // multiple_choice | text_answer | vua_tieng_viet
+  questionText  String
+  imageUrl      String?
+  optionA       String?
+  optionB       String?
+  optionC       String?
+  optionD       String?
+  correctAnswer String   // A/B/C/D hoặc text đáp án
+  explanation   String?
+  timeLimit     Int      @default(30) // giây
+  baseScore     Int      @default(100)
+  createdAt     DateTime @default(now())
+  answers       Answer[]
+}
+
+// Phiên chơi (1 buổi live)
+model GameSession {
+  id              String   @id @default(uuid())
+  quizSetId       Int
+  quizSet         QuizSet  @relation(fields: [quizSetId], references: [id])
+  tiktokUsername  String   // username của streamer
+  status          String   @default("waiting") // waiting | active | paused | ended
+  currentQuestionId Int?
+  startedAt       DateTime?
+  endedAt         DateTime?
+  createdAt       DateTime @default(now())
+  players         Player[]
+  answers         Answer[]
+}
+
+// Người chơi (khán giả TikTok)
+model Player {
+  id            Int         @id @default(autoincrement())
+  sessionId     String
+  session       GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  tiktokUserId  String
+  nickname      String
+  avatarUrl     String?
+  totalScore    Int         @default(0)
+  correctCount  Int         @default(0)
+  wrongCount    Int         @default(0)
+  rank          Int?
+  joinedAt      DateTime    @default(now())
+  answers       Answer[]
+
+  @@unique([sessionId, tiktokUserId])
+}
+
+// Đáp án của người chơi
+model Answer {
+  id           Int         @id @default(autoincrement())
+  sessionId    String
+  session      GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  questionId   Int
+  question     Question    @relation(fields: [questionId], references: [id])
+  playerId     Int
+  player       Player      @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  answerText   String      // đáp án người chơi comment
+  isCorrect    Boolean     @default(false)
+  score        Int         @default(0)
+  responseTime Float       @default(0) // giây từ lúc câu hỏi bắt đầu
+  createdAt    DateTime    @default(now())
+
+  @@unique([sessionId, questionId, playerId])
+}

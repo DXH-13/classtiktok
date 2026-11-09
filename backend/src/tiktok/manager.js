@@ -1,4 +1,7 @@
-const { WebcastPushConnection } = require('tiktok-live-connector');
+// tiktok-live-connector v2.x là ESM-only — backend vẫn là CommonJS nên
+// load bằng dynamic import() trong hàm connect(). Không dùng require()
+// vì v2 đã bỏ hỗ trợ CommonJS (require trả về object rỗng, gây lỗi
+// "WebcastPushConnection is not a constructor" ở v2).
 const { gameState } = require('../quiz/gameState');
 const { calculateScore, classifyAnswer } = require('../quiz/scoreEngine');
 const { checkWithGemini, isAIEnabled, AI_MIN_CONFIDENCE } = require('../quiz/aiChecker');
@@ -17,7 +20,7 @@ class TikTokManager {
   }
 
   /**
-   * Kết nối vào TikTok Live của 1 username
+   * Kết nối vào TikTok Live của 1 username (tiktok-live-connector v2)
    */
   async connect(tiktokUsername, sessionId) {
     if (this.connection) {
@@ -27,38 +30,43 @@ class TikTokManager {
     console.log(`📡 Đang kết nối TikTok Live: @${tiktokUsername}`);
     this.activeSessionId = sessionId;
 
-    this.connection = new WebcastPushConnection(tiktokUsername, {
+    // v2 là ESM-only: import động, backend CommonJS vẫn dùng được (Node 18+).
+    const { TikTokLiveConnection, WebcastEvent, ControlEvent } = await import('tiktok-live-connector');
+
+    this.connection = new TikTokLiveConnection(tiktokUsername, {
       processInitialData: false,
       fetchRoomInfoOnConnect: true,
       enableExtendedGiftInfo: false,
-      requestPollingIntervalMs: 1000,
-      sessionId: undefined,
+      // Key Euler riêng (không bắt buộc): khi hết quota ký miễn phí thì
+      // tạo key free tại https://www.eulerstream.com rồi bỏ vào .env EULER_API_KEY.
+      signApiKey: process.env.EULER_API_KEY || undefined,
     });
 
-    this.connection.on('connect', (state) => {
+    this.connection.on(ControlEvent.CONNECTED, (state) => {
       this.isConnected = true;
       console.log(`✅ Kết nối TikTok Live thành công! Room: ${state.roomId}`);
       this.io?.emit('tiktok:connected', { username: tiktokUsername, roomId: state.roomId });
     });
 
-    this.connection.on('disconnect', () => {
+    this.connection.on(ControlEvent.DISCONNECTED, ({ code, reason } = {}) => {
       this.isConnected = false;
-      console.log('❌ Mất kết nối TikTok Live');
+      console.log(`❌ Mất kết nối TikTok Live${code ? ` (${code})` : ''}${reason ? `: ${reason}` : ''}`);
       this.io?.emit('tiktok:disconnected');
     });
 
-    this.connection.on('error', (err) => {
-      console.error('TikTok error:', err.message);
-      this.io?.emit('tiktok:error', { message: err.message });
+    this.connection.on(ControlEvent.ERROR, ({ info, exception } = {}) => {
+      const msg = (exception && exception.message) || info || 'Unknown TikTok error';
+      console.error('TikTok error:', msg);
+      this.io?.emit('tiktok:error', { message: msg });
     });
 
-    // Lắng nghe comment
-    this.connection.on('chat', (data) => {
+    // Lắng nghe comment (v2: WebcastChatMessage { user: {...}, comment })
+    this.connection.on(WebcastEvent.CHAT, (data) => {
       this._handleComment(data);
     });
 
     // Viewer count
-    this.connection.on('roomUser', (data) => {
+    this.connection.on(WebcastEvent.ROOM_USER, (data) => {
       this.io?.emit('tiktok:viewerCount', { count: data.viewerCount });
     });
 
@@ -74,7 +82,7 @@ class TikTokManager {
   async disconnect() {
     if (this.connection) {
       try {
-        this.connection.disconnect();
+        await this.connection.disconnect();
       } catch {}
       this.connection = null;
       this.isConnected = false;
@@ -105,9 +113,11 @@ class TikTokManager {
     if (!session.currentQuestion) return;
 
     const q = session.currentQuestion;
-    const tiktokUserId = String(data.userId);
-    const nickname = data.nickname || 'Ẩn danh';
-    const avatarUrl = data.profilePictureUrl || '';
+    // v2: user nằm lồng trong data.user { userId, uniqueId, nickname, profilePictureUrl }
+    const user = data.user || {};
+    const tiktokUserId = String(user.userId ?? data.userId ?? user.uniqueId ?? '');
+    const nickname = user.nickname || data.nickname || 'Ẩn danh';
+    const avatarUrl = user.profilePictureUrl || data.profilePictureUrl || '';
     const commentText = data.comment || '';
 
     // 1. Luật chấm ngay
